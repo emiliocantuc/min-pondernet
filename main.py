@@ -138,7 +138,8 @@ def eval_forward(
     y_hats = torch.gather(y_hats, dim=1, index=first_halt_ix)
     y_hats = rearrange(y_hats, "b 1 1 -> b 1")
 
-    return y_hats, step + 1
+    avg_halt_steps = first_halt_ix.float().mean().item() + 1
+    return y_hats, avg_halt_steps, step + 1
 
 
 @torch.no_grad()
@@ -150,16 +151,17 @@ def eval(
     max_ponder_steps: int,
     device: torch.device,
 ):
-    acc, avg_steps = 0.0, 0.0
+    acc, avg_steps, avg_batch_steps = 0.0, 0.0, 0.0
     for _ in range(steps):
         x, y = get_parity_batch(bs, seq_len, device=device)
 
-        y_hats, ponder_steps = eval_forward(s, x, max_ponder_steps)
+        y_hats, avg_ponder_steps, batch_steps = eval_forward(s, x, max_ponder_steps)
         pred = (torch.sigmoid(y_hats) > 0.5).long()
         acc += (pred == y).float().mean().item()
-        avg_steps += ponder_steps
+        avg_steps += avg_ponder_steps
+        avg_batch_steps += batch_steps
 
-    return acc / steps, avg_steps / steps
+    return acc / steps, avg_steps / steps, avg_batch_steps / steps
 
 
 def train_loss(
@@ -197,7 +199,7 @@ def train_loss(
     )
 
     loss = L_rec + beta * L_reg
-    return loss, L_rec, L_reg
+    return loss, L_rec, L_reg, p_n
 
 
 if __name__ == "__main__":
@@ -264,7 +266,7 @@ if __name__ == "__main__":
         y_hats = rearrange(y_hats, "t b 1 -> b t 1")
         lamb_hats = rearrange(lamb_hats, "t b 1 -> b t 1")
 
-        loss, rec_loss, kl_loss = train_loss(
+        loss, rec_loss, kl_loss, p_n = train_loss(
             y_hats, lamb_hats, y, p_G, beta=args.beta, eps=args.eps
         )
 
@@ -273,7 +275,7 @@ if __name__ == "__main__":
         opt.zero_grad()
 
         if step % 500 == 0:
-            acc, avg_steps = eval(
+            acc, avg_steps, avg_batch_steps = eval(
                 s,
                 steps=args.eval_steps,
                 bs=bs,
@@ -281,8 +283,18 @@ if __name__ == "__main__":
                 max_ponder_steps=max_ponder_steps,
                 device=device,
             )
+
+            p_n = rearrange(p_n.clamp_min(1e-9), "b t 1 -> b t")
+            p_n_E = -(p_n * p_n.log()).sum(dim=1).mean().item()
+
+            En = (
+                (p_n * torch.arange(1, p_n.size(1) + 1, device=p_n.device))
+                .sum(dim=1)
+                .mean()
+                .item()
+            )
             print(
-                f"Step {step}: loss {loss.item():.4f}, acc {acc:.4f}, avg steps {avg_steps:.2f}"
+                f"Step {step:<5}: loss {loss.item():.4f}, acc {acc:.4f}, avg steps {avg_steps:.2f}, avg batch steps: {avg_batch_steps:.2f}, lamb mean {lamb_hats.mean().item():.4f}, lamb std {lamb_hats.std().item():.4f}, p_n entropy {p_n_E:.4f}, E[n] {En:.3f}"
             )
 
             if args.wandb:
@@ -294,7 +306,10 @@ if __name__ == "__main__":
                         "train/h_norm_mean": sum(h_norms) / len(h_norms),
                         "train/h_norm_max": max(h_norms),
                         "train/h_norm_min": min(h_norms),
+                        "train/p_n_entropy": p_n_E,
+                        "train/p_n_E[n]": En,
                         "train/lamb_mean": lamb_hats.mean().item(),
+                        "train/lamb_std": lamb_hats.std().item(),
                         "train/lamb_max": lamb_hats.max().item(),
                         "train/lamb_min": lamb_hats.min().item(),
                         "eval/acc": acc,
