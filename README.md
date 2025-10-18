@@ -8,7 +8,7 @@ A single-file reproduction of [PonderNet](https://arxiv.org/abs/2107.05407) trai
 # clone repo or download main.py
 uv run main.py
 # or just
-uv run https://raw.githubusercontent.com/emiliocantuc/min-pondernet/main.py
+uv run https://raw.githubusercontent.com/emiliocantuc/min-pondernet/refs/heads/main/main.py
 ```
 
 ### Citations
