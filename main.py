@@ -11,7 +11,7 @@
 
 # PonderNet (https://arxiv.org/abs/2107.05407) trained on a parity task.
 
-# Glossary
+# Dim glossary
 # b: batch size (bs)
 # s: sequence length (seq_len)
 # t: time steps (ponder steps)
@@ -34,7 +34,7 @@ def get_parity_batch(
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.float32,
 ) -> tuple[Float[Tensor, "b s"], Int[Tensor, "b 1"]]:
-    # per row
+    # no. of non-zero entries per row
     k_non_zero = torch.randint(1, seq_len + 1, (bs, 1), device=device)
 
     # k_non_zero entries per row set to True, uniformly at random
@@ -211,7 +211,7 @@ if __name__ == "__main__":
     parser.add_argument("--lamb_prior", type=float, default=0.1)
     parser.add_argument("--beta", type=float, default=0.01)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--bs", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--eval_steps", type=int, default=32)
     parser.add_argument("--eps", type=float, default=1e-7)
     parser.add_argument("--wandb", action="store_true", default=False)
@@ -231,7 +231,7 @@ if __name__ == "__main__":
     print(f"Using max ponder steps: {max_ponder_steps}")
 
     # train
-    bs, seq_len = args.bs, args.seq_len
+    bs, seq_len = args.batch_size, args.seq_len
     p_G = gen_geo_pmf(
         torch.full((bs, max_ponder_steps, 1), fill_value=args.lamb_prior), eps=args.eps
     ).to(device)
@@ -249,10 +249,10 @@ if __name__ == "__main__":
     for step in range(args.steps):
         x, y = get_parity_batch(bs, seq_len, device=device)
 
-        h = None
         y_hats, lamb_hats = [], []
         h_norms = []  # for logging
 
+        h = None
         for _ in range(max_ponder_steps):
             y_hat, h, lamb_hat = s(x, h)
 
