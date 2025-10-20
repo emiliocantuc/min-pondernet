@@ -60,6 +60,15 @@ def gen_geo_pmf(
     return p_n / p_n.sum(dim=dim, keepdim=True).clamp_min(eps)
 
 
+def gen_geo_pmf_from_logits(
+    z: Float[Tensor, "b t 1"], dim=1, eps=1e-12
+) -> Float[Tensor, "b t 1"]:
+    sp = F.softplus(z)
+    log_p = z - torch.cumsum(sp, dim=dim)
+    log_p = log_p - torch.logsumexp(log_p, dim=dim, keepdim=True)
+    return torch.exp(log_p).clamp_min(eps)
+
+
 def init_gru_cell_orthogonal(cell: nn.GRUCell, update_bias=1.0):
     for name, p in cell.named_parameters():
         if "weight_hh" in name:
@@ -83,13 +92,8 @@ class ParityStepModel(nn.Module):
         init_gru_cell_orthogonal(self.rnn, update_bias=1.0)
 
         self.layer_norm = nn.LayerNorm(h_dim)
-
         self.output_head = nn.Linear(h_dim, 1)
-
-        self.lambda_head = nn.Sequential(
-            nn.Linear(h_dim, 1),
-            nn.Sigmoid(),  # TODO maybe omit and output logits or logsigmoid
-        )
+        self.lambda_head = nn.Linear(h_dim, 1)
 
     def forward(
         self, x: Float[Tensor, "b s"], h: Float[Tensor, "b h"] = None
@@ -103,9 +107,25 @@ class ParityStepModel(nn.Module):
         return self.output_head(h), h, self.lambda_head(h)
 
 
+def train_forward(s: ParityStepModel, x: Float[Tensor, "b s"], max_ponder_steps: int):
+    y_hats, lamb_hats = [], []
+
+    h = None
+    for _ in range(max_ponder_steps):
+        y_hat, h, lamb_hat = s(x, h)
+
+        y_hats.append(y_hat)
+        lamb_hats.append(lamb_hat)
+
+    y_hats = rearrange(y_hats, "t b 1 -> b t 1")
+    lamb_hats = rearrange(lamb_hats, "t b 1 -> b t 1")
+
+    return y_hats, lamb_hats
+
+
 def eval_forward(
     s: ParityStepModel, x: Float[Tensor, "b s"], max_ponder_steps: int
-) -> Float[Tensor, "b 1"]:
+) -> tuple[Float[Tensor, "b 1"], float, int]:
     bs, seq_len = x.shape
 
     y_hats, lamb_hats, should_halts = [], [], []
@@ -114,6 +134,7 @@ def eval_forward(
     h = None
     for step in range(max_ponder_steps):
         y_hat, h, lamb_hat = s(x, h)
+        lamb_hat = torch.sigmoid(lamb_hat)
 
         should_halt = torch.rand_like(lamb_hat) <= lamb_hat
 
@@ -175,7 +196,7 @@ def train_loss(
     b, t, _ = y_hats.shape
 
     # Halting distribution
-    p_n = gen_geo_pmf(lamb_hats, eps=eps)  # (b, t, 1)
+    p_n = gen_geo_pmf_from_logits(lamb_hats, eps=eps)  # (b, t, 1)
 
     # Reconstruction loss
     L_rec = F.binary_cross_entropy_with_logits(
@@ -205,7 +226,7 @@ def train_loss(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=100_000)
-    parser.add_argument("--seq_len", type=int, default=64)
+    parser.add_argument("--seq_len", type=int, default=48)
     parser.add_argument("--h_dim", type=int, default=128)
     parser.add_argument("--max_ponder_steps", type=int, default=None)
     parser.add_argument("--max_steps_eps", type=float, default=0.05)
@@ -223,7 +244,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    bs, seq_len = args.batch_size, args.seq_len
     max_ponder_steps = args.max_ponder_steps
+
     if args.max_ponder_steps is None:
         # determine max ponder steps from lamb_prior and max_steps_eps (see Sec 2.3)
         _p_G = gen_geo_pmf(
@@ -232,8 +255,7 @@ if __name__ == "__main__":
         max_ponder_steps = (_p_G.cumsum(0) < (1 - args.max_steps_eps)).sum().item()
     print(f"Using max ponder steps: {max_ponder_steps}")
 
-    # train
-    bs, seq_len = args.batch_size, args.seq_len
+    # prior halting distribution
     p_G = gen_geo_pmf(
         torch.full((bs, max_ponder_steps, 1), fill_value=args.lamb_prior), eps=args.eps
     ).to(device)
@@ -250,21 +272,7 @@ if __name__ == "__main__":
 
     for step in range(args.steps):
         x, y = get_parity_batch(bs, seq_len, device=device)
-
-        y_hats, lamb_hats = [], []
-        h_norms = []  # for logging
-
-        h = None
-        for _ in range(max_ponder_steps):
-            y_hat, h, lamb_hat = s(x, h)
-
-            y_hats.append(y_hat)
-            lamb_hats.append(lamb_hat)
-
-            h_norms.append(h.norm().item())
-
-        y_hats = rearrange(y_hats, "t b 1 -> b t 1")
-        lamb_hats = rearrange(lamb_hats, "t b 1 -> b t 1")
+        y_hats, lamb_hats = train_forward(s, x, max_ponder_steps)
 
         loss, rec_loss, kl_loss, p_n = train_loss(
             y_hats, lamb_hats, y, p_G, beta=args.beta, eps=args.eps
@@ -285,35 +293,44 @@ if __name__ == "__main__":
             )
 
             p_n = rearrange(p_n.clamp_min(1e-9), "b t 1 -> b t")
-            p_n_E = -(p_n * p_n.log()).sum(dim=1).mean().item()
-
-            En = (
+            p_n_H = -(p_n * p_n.log()).sum(dim=1).mean().item()
+            E_n = (
                 (p_n * torch.arange(1, p_n.size(1) + 1, device=p_n.device))
                 .sum(dim=1)
                 .mean()
                 .item()
             )
-            print(
-                f"Step {step:<5}: loss {loss.item():.4f}, acc {acc:.4f}, avg steps {avg_steps:.2f}, avg batch steps: {avg_batch_steps:.2f}, lamb mean {lamb_hats.mean().item():.4f}, lamb std {lamb_hats.std().item():.4f}, p_n entropy {p_n_E:.4f}, E[n] {En:.3f}"
-            )
+
+            metrics = {
+                "train/loss": loss.item(),
+                "train/rec_loss": rec_loss.item(),
+                "train/kl_loss": kl_loss.item(),
+                "train/p_sum": p_n.sum(dim=1).mean().item(),
+                "train/p_last": p_n[:, -1].mean().item(),
+                "train/p_n_entropy": p_n_H,
+                "train/E[n]": E_n,
+                "train/lamb_mean": lamb_hats.mean().item(),
+                "train/lamb_std": lamb_hats.std().item(),
+                "train/lamb_max": lamb_hats.max().item(),
+                "train/lamb_min": lamb_hats.min().item(),
+                "eval/acc": acc,
+                "eval/avg_steps": avg_steps,
+                "eval/avg_batch_steps": avg_batch_steps,
+            }
+
+            metrics_to_print = [
+                "train/loss",
+                "eval/acc",
+                "eval/avg_steps",
+                "train/E[n]",
+                "train/p_last",
+                "train/lamb_mean",
+            ]
+
+            print(f"{step:<5} | ", end="")
+            for metric in metrics_to_print:
+                print(f"{metric.split('/')[-1]}: {metrics[metric]:.3f}, ", end="")
+            print("")
 
             if args.wandb:
-                wandb.log(
-                    {
-                        "train/loss": loss.item(),
-                        "train/rec_loss": rec_loss.item(),
-                        "train/kl_loss": kl_loss.item(),
-                        "train/h_norm_mean": sum(h_norms) / len(h_norms),
-                        "train/h_norm_max": max(h_norms),
-                        "train/h_norm_min": min(h_norms),
-                        "train/p_n_entropy": p_n_E,
-                        "train/p_n_E[n]": En,
-                        "train/lamb_mean": lamb_hats.mean().item(),
-                        "train/lamb_std": lamb_hats.std().item(),
-                        "train/lamb_max": lamb_hats.max().item(),
-                        "train/lamb_min": lamb_hats.min().item(),
-                        "eval/acc": acc,
-                        "eval/avg_ponder_steps": avg_steps,
-                    },
-                    step=step,
-                )
+                wandb.log(metrics, step=step)
