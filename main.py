@@ -50,6 +50,11 @@ def get_parity_batch(
     return x, y
 
 
+# These renormalize to condition on n <= N
+# TODO try assigning lamb_N = 1 - sum_{i=1}^{N-1} lamb_i instead
+# (see Sec 2.3)
+
+
 def gen_geo_pmf(
     lamb: Float[Tensor, "b t 1"], dim: int = 1, eps=1e-7
 ) -> Float[Tensor, "b t 1"]:
