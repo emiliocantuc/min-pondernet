@@ -50,27 +50,49 @@ def get_parity_batch(
     return x, y
 
 
-# These renormalize to condition on n <= N
-# TODO try assigning lamb_N = 1 - sum_{i=1}^{N-1} lamb_i instead
-# (see Sec 2.3)
+def _last_slice(t: Tensor, dim: int) -> tuple:
+    last = t.size(dim) - 1
+    idx = [slice(None)] * t.dim()
+    idx[dim] = slice(last, last + 1)
+    return tuple(idx), last
 
 
 def gen_geo_pmf(
-    lamb: Float[Tensor, "b t 1"], dim: int = 1, eps=1e-7
+    lamb: Float[Tensor, "b t 1"],
+    dim: int = 1,
+    truncated: bool = False,
+    eps: float = 1e-7,
 ) -> Float[Tensor, "b t 1"]:
-    # Calculates lamb_n * prod_{i=1}^{n-1} (1 - lamb_i)
     lamb = lamb.clamp(min=eps, max=1 - eps)
-    log_1m_lamb = (-lamb).log1p()
-    p_n = torch.exp(log_1m_lamb.cumsum(dim=dim) - log_1m_lamb + lamb.log())
-    return p_n / p_n.sum(dim=dim, keepdim=True).clamp_min(eps)
+    log_1m = torch.log1p(-lamb)
+    p_n = torch.exp(torch.cumsum(log_1m, dim=dim) - log_1m + lamb.log())
+
+    if truncated:
+        # condition on n <= N (i.e., renormalize)
+        p_n = p_n / p_n.sum(dim=dim, keepdim=True).clamp_min(eps)
+    else:
+        # set remaining mass to last step
+        rem = 1 - p_n.sum(dim=dim, keepdim=True)
+        sl, _ = _last_slice(p_n, dim)
+        p_n[sl] = p_n[sl] + rem
+
+    return p_n
 
 
 def gen_geo_pmf_from_logits(
-    z: Float[Tensor, "b t 1"], dim=1, eps=1e-12
+    z: Float[Tensor, "b t 1"], dim: int = 1, truncated: bool = False, eps: float = 1e-12
 ) -> Float[Tensor, "b t 1"]:
     sp = F.softplus(z)
-    log_p = z - torch.cumsum(sp, dim=dim)
-    log_p = log_p - torch.logsumexp(log_p, dim=dim, keepdim=True)
+    cs_sp = torch.cumsum(sp, dim=dim)
+    log_p = z - cs_sp  # unnormalized log p_n
+
+    if truncated:
+        log_p = log_p - torch.logsumexp(log_p, dim=dim, keepdim=True)
+    else:
+        excl_sp = cs_sp - sp
+        sl, last = _last_slice(log_p, dim)
+        log_p[sl] = -excl_sp.narrow(dim, last, 1)
+
     return torch.exp(log_p).clamp_min(eps)
 
 
@@ -196,12 +218,13 @@ def train_loss(
     y: Float[Int, "b 1"],
     p_G: Float[Tensor, "b t 1"],
     beta: float = 0.01,
+    truncated: bool = False,
     eps: float = 1e-7,
 ):
     b, t, _ = y_hats.shape
 
     # Halting distribution
-    p_n = gen_geo_pmf_from_logits(lamb_hats, eps=eps)  # (b, t, 1)
+    p_n = gen_geo_pmf_from_logits(lamb_hats, truncated=truncated, eps=eps)  # (b, t, 1)
 
     # Reconstruction loss
     L_rec = F.binary_cross_entropy_with_logits(
@@ -236,12 +259,12 @@ if __name__ == "__main__":
     parser.add_argument("--max_ponder_steps", type=int, default=None)
     parser.add_argument("--max_steps_eps", type=float, default=0.05)
     parser.add_argument("--abs_max_ponder_steps", type=int, default=100)
+    parser.add_argument("--truncated", action="store_true", default=False)
     parser.add_argument("--lamb_prior", type=float, default=0.1)
     parser.add_argument("--beta", type=float, default=0.01)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--eval_steps", type=int, default=32)
-    parser.add_argument("--eps", type=float, default=1e-7)
     parser.add_argument("--wandb", action="store_true", default=False)
 
     args = parser.parse_args()
@@ -255,14 +278,17 @@ if __name__ == "__main__":
     if args.max_ponder_steps is None:
         # determine max ponder steps from lamb_prior and max_steps_eps (see Sec 2.3)
         _p_G = gen_geo_pmf(
-            torch.full((args.abs_max_ponder_steps,), fill_value=args.lamb_prior), dim=0
+            torch.full((args.abs_max_ponder_steps,), fill_value=args.lamb_prior),
+            dim=0,
+            truncated=True,
         )
         max_ponder_steps = (_p_G.cumsum(0) < (1 - args.max_steps_eps)).sum().item()
     print(f"Using max ponder steps: {max_ponder_steps}")
 
     # prior halting distribution
     p_G = gen_geo_pmf(
-        torch.full((bs, max_ponder_steps, 1), fill_value=args.lamb_prior), eps=args.eps
+        torch.full((bs, max_ponder_steps, 1), fill_value=args.lamb_prior),
+        truncated=args.truncated,
     ).to(device)
 
     s = ParityStepModel(seq_len=seq_len, h_dim=args.h_dim).to(device)
@@ -280,7 +306,7 @@ if __name__ == "__main__":
         y_hats, lamb_hats = train_forward(s, x, max_ponder_steps)
 
         loss, rec_loss, kl_loss, p_n = train_loss(
-            y_hats, lamb_hats, y, p_G, beta=args.beta, eps=args.eps
+            y_hats, lamb_hats, y, p_G, beta=args.beta, truncated=args.truncated
         )
 
         loss.backward()
