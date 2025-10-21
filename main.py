@@ -266,11 +266,14 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--eval_steps", type=int, default=32)
     parser.add_argument("--wandb", action="store_true", default=False)
+    parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    torch.manual_seed(args.seed)
 
     bs, seq_len = args.batch_size, args.seq_len
     max_ponder_steps = args.max_ponder_steps
